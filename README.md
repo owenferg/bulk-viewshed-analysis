@@ -28,8 +28,8 @@ some linux systems may also need `python3-tk`
 1. choose your **observer locations csv**
 2. add your **terrain elevation data** as individual rasters or a folder
 3. choose an **output folder**
-4. set **location crs** to the crs used by the csv coordinates
-5. leave **viewshed crs** as `auto-utm` unless your project needs one shared projected crs
+4. set **location CRS** to the CRS used by the csv coordinates
+5. leave **viewshed CRS** as `auto-utm` unless your project needs one shared projected CRS
 6. set the cell size distance and heights for your analysis
 7. choose **check inputs**
 8. once the check passes choose **run viewsheds**
@@ -71,7 +71,7 @@ choose **open output folder** when the run finishes
 
 ```text
 output folder/
-├── rasters/       one geotiff viewshed per observer
+├── rasters/       one GeoTIFF viewshed per observer
 ├── state/         information used to validate and resume each result
 └── manifest.json  settings and results for the full run
 ```
@@ -81,6 +81,6 @@ in the default output mode `1` is visible `0` is hidden `254` is outside the max
 ## Issues you may come across
 
 - if GDAL is not found, open the advanced tab and choose your QGIS or GDAL folder
-- if an observer is outside the elevation data, check the location crs and coordinate order
+- if an observer is outside the elevation data, check the location CRS and coordinate order
 - if elevation coverage is incomplete, add the missing raster tiles before running again
 - if a run is interrupted, leave existing outputs set to **resume finished viewsheds** and start it again
