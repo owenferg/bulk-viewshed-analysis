@@ -1,0 +1,3 @@
+id,x,y,observer_height,target_height,max_distance
+ridge-tower,-121.7500,45.5000,15,2,20000
+valley-site,-121.6250,45.4250,,,10000

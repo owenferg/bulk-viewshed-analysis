@@ -1,0 +1,9 @@
+output/
+.work/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.aux.xml
+build/
+dist/
+*.egg-info/
