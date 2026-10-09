@@ -1,6 +1,6 @@
 [project]
 name = "bulk-gdal-viewshed"
-version = "1.1.0"
+version = "1.2.0"
 description = "Cross-platform desktop and command-line bulk GDAL terrain viewshed analysis"
 readme = "README.md"
 requires-python = ">=3.10"

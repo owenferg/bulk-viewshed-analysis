@@ -89,6 +89,7 @@ class GdalRuntime:
     tool_directories: tuple[Path, ...]
     proj_data: Path | None = None
     gdal_data: Path | None = None
+    python: Path | None = None
 
     def environment(self, base: Mapping[str, str] | None = None) -> dict[str, str]:
         """add the discovered tools and data folders to a child environment"""
@@ -142,13 +143,48 @@ def runtime_from_location(
             None,
         )
 
+    # qgis 4 on macos keeps its data under Contents/Resources/qgis and osgeo4w
+    # splits it between the install root and the gdal app folder
     runtime = GdalRuntime(
         location,
         directories,
-        first_directory(("share/proj", "apps/qgis/share/proj", "Contents/Resources/proj")),
-        first_directory(("share/gdal", "apps/qgis/share/gdal", "Contents/Resources/gdal")),
+        first_directory(
+            (
+                "share/proj",
+                "apps/qgis/share/proj",
+                "apps/qgis-ltr/share/proj",
+                "Contents/Resources/qgis/proj",
+                "Contents/Resources/proj",
+            )
+        ),
+        first_directory(
+            (
+                "share/gdal",
+                "apps/gdal/share/gdal",
+                "apps/qgis/share/gdal",
+                "apps/qgis-ltr/share/gdal",
+                "Contents/Resources/qgis/gdal",
+                "Contents/Resources/gdal",
+            )
+        ),
+        bundled_python(root_candidates),
     )
     return None if runtime.missing_tools(required) else runtime
+
+
+def bundled_python(roots: Sequence[Path]) -> Path | None:
+    """find the interpreter a qgis install ships for gdal utility scripts"""
+
+    for root in roots:
+        candidates = [
+            root / "bin/python3.exe",
+            *sorted(root.glob("apps/Python*/python.exe"), reverse=True),
+            root / "Contents/MacOS/python",
+        ]
+        found = next((path for path in candidates if path.is_file()), None)
+        if found:
+            return found
+    return None
 
 
 def standard_install_locations(

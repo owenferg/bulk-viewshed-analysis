@@ -29,8 +29,43 @@ from typing import Any, Iterable, Sequence
 from gdal_runtime import discover_gdal_runtime
 
 
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
+# only changes when raster results change so viewsheds finished by an earlier
+# release with the same raster pipeline can still be resumed
+RASTER_PIPELINE_VERSION = "1.1.0"
+POLYGON_PIPELINE_VERSION = 1
 MINIMUM_GDAL_VERSION = (3, 4, 2)
+# each observer needs its own terrain crop in memory so half the cores is a
+# safer starting point than all of them
+DEFAULT_JOBS = max(1, min(4, (os.cpu_count() or 2) // 2))
+RASTER_TOOLS = (
+    "gdal_viewshed",
+    "gdalbuildvrt",
+    "gdalinfo",
+    "gdalsrsinfo",
+    "gdaltransform",
+    "gdalwarp",
+)
+POLYGON_TOOLS = ("gdal_polygonize", "ogr2ogr", "ogrinfo")
+SHAPEFILE_PARTS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
+# shapefile attribute names are limited to 10 characters
+SHAPEFILE_FIELD_NAMES = {
+    "observer_height": "obs_height",
+    "target_height": "tgt_height",
+    "max_distance": "max_dist",
+    "analysis_crs": "crs",
+    "visible_area": "vis_area",
+}
+# the values of an observer that change its viewshed; its name and its row in
+# the csv do not, so renumbering or reordering rows keeps finished work
+OBSERVER_KEY_FIELDS = ("x", "y", "observer_height", "target_height", "max_distance")
+OBSERVER_LAYER = "viewsheds"
+COVERAGE_LAYER = "coverage"
+# share of one observer's work that is finished when each stage starts
+STAGE_STARTS = {
+    False: {"preparing": 0.0, "viewshed": 0.5, "complete": 1.0},
+    True: {"preparing": 0.0, "viewshed": 0.2, "polygon": 0.4, "complete": 1.0},
+}
 DISCOVERED_RASTER_EXTENSIONS = {".tif", ".tiff", ".img"}
 CSV_COLUMNS = {
     "id",
@@ -89,6 +124,19 @@ class Plan:
     stem: str
     output: Path
     state: Path
+    polygon: Path
+    shapefile: Path
+
+
+@dataclass(frozen=True)
+class PolygonSettings:
+    """polygon choices shared by every observer in a run"""
+
+    crs: str
+    simplify: float
+    clip: Path | None  # already projected to the polygon crs
+    config_hash: str
+    shapefiles: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,6 +152,18 @@ def utc_now() -> str:
     """return a compact utc timestamp for state and manifest files"""
 
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def format_duration(seconds: float) -> str:
+    """shorten a run time for log lines"""
+
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remainder:.0f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m"
 
 
 def log(message: str) -> None:
@@ -277,8 +337,8 @@ def load_observers(
     return observers
 
 
-def safe_stem(identifier: str, row_number: int) -> str:
-    """make a stable output name that works on every supported system"""
+def safe_stem(identifier: str) -> str:
+    """make an output name from an id that works on every supported system"""
 
     normalized = unicodedata.normalize("NFKD", identifier)
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
@@ -286,8 +346,27 @@ def safe_stem(identifier: str, row_number: int) -> str:
     cleaned = re.sub(r"_+", "_", cleaned) or "observer"
     if cleaned.upper() in WINDOWS_RESERVED_NAMES:
         cleaned = f"_{cleaned}"
-    cleaned = cleaned[:80].rstrip(" .") or "observer"
-    return f"{row_number - 1:06d}_{cleaned}"
+    return cleaned[:80].rstrip(" .") or "observer"
+
+
+def observer_stems(observers: Sequence[Observer]) -> dict[str, str]:
+    """name each observer's outputs after its id alone
+
+    Names used to start with the csv row number, so adding a row above an
+    observer renamed its files and its viewshed was calculated again.
+    """
+
+    cleaned = {observer.id: safe_stem(observer.id) for observer in observers}
+    counts: dict[str, int] = {}
+    for stem in cleaned.values():
+        counts[stem.casefold()] = counts.get(stem.casefold(), 0) + 1
+    return {
+        # different ids can clean to the same name and then need telling apart
+        identifier: stem
+        if counts[stem.casefold()] == 1
+        else f"{stem}_{hashlib.sha256(identifier.encode('utf-8')).hexdigest()[:8]}"
+        for identifier, stem in cleaned.items()
+    }
 
 
 def discover_dems(paths: Iterable[Path]) -> list[Path]:
@@ -517,6 +596,7 @@ def inspect_raster(
     raster: Path,
     stats: bool = False,
     checksum: bool = False,
+    histogram: bool = False,
 ) -> dict[str, Any]:
     """read raster metadata as json with optional validation statistics"""
 
@@ -525,6 +605,8 @@ def inspect_raster(
         arguments.append("-stats")
     if checksum:
         arguments.append("-checksum")
+    if histogram:
+        arguments.append("-hist")
     arguments.append(str(raster))
     result = toolchain.run("gdalinfo", arguments)
     try:
@@ -587,6 +669,27 @@ def band_valid_percent(info: dict[str, Any], band_number: int) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def visible_summary(
+    info: dict[str, Any],
+    visible_value: int,
+    cell_size: float,
+) -> dict[str, Any] | None:
+    """count visible cells from the one bucket per value histogram of a byte raster"""
+
+    band = (info.get("bands") or [{}])[0]
+    histogram = band.get("histogram") or {}
+    buckets = histogram.get("buckets") or []
+    if (
+        band.get("type") != "Byte"
+        or len(buckets) != 256
+        or histogram.get("min") != -0.5
+        or histogram.get("max") != 255.5
+    ):
+        return None
+    cells = int(buckets[visible_value])
+    return {"cells": cells, "area": cells * cell_size**2}
 
 
 def file_sha256(path: Path) -> str:
@@ -664,6 +767,7 @@ def build_plans(
     if not geotransform:
         raise ValueError("source dem has no affine geotransform")
 
+    stems = observer_stems(observers)
     plans: list[Plan] = []
     for observer in observers:
         source_x, source_y = transform_point(
@@ -686,7 +790,7 @@ def build_plans(
         observer_x, observer_y = transform_point(
             toolchain, observer.x, observer.y, observer_crs, analysis_crs
         )
-        stem = safe_stem(observer.id, observer.row_number)
+        stem = stems[observer.id]
         plans.append(
             Plan(
                 observer,
@@ -696,6 +800,8 @@ def build_plans(
                 stem,
                 output_directory / "rasters" / f"{stem}.tif",
                 output_directory / "state" / f"{stem}.json",
+                output_directory / "polygons" / f"{stem}.gpkg",
+                output_directory / "shapefiles" / f"{stem}.shp",
             )
         )
     return plans
@@ -720,13 +826,27 @@ def write_json(path: Path, document: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def state_reusable(plan: Plan, fingerprint: str, toolchain: Toolchain) -> bool:
-    """confirm that saved state still matches a healthy output raster"""
+def read_state(plan: Plan) -> dict[str, Any] | None:
+    """load the saved state for one observer when it is readable"""
 
-    if not plan.output.is_file() or not plan.state.is_file():
-        return False
     try:
         state = json.loads(plan.state.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def state_reusable(
+    plan: Plan,
+    state: dict[str, Any] | None,
+    fingerprint: str,
+    toolchain: Toolchain,
+) -> bool:
+    """confirm that saved state still matches a healthy output raster"""
+
+    if state is None or not plan.output.is_file():
+        return False
+    try:
         if state.get("status") != "complete" or state.get("fingerprint") != fingerprint:
             return False
         # the fingerprint checks inputs while the hash dimensions and gdal
@@ -742,57 +862,150 @@ def state_reusable(plan: Plan, fingerprint: str, toolchain: Toolchain) -> bool:
             return False
         if plan.output.stat().st_size != expected.get("bytes"):
             return False
-    except (OSError, ValueError, ToolError, json.JSONDecodeError):
+    except (OSError, ValueError, ToolError):
         return False
     return True
+
+
+def polygon_reusable(plan: Plan, state: dict[str, Any] | None, fingerprint: str) -> bool:
+    """confirm that a saved polygon was built from this raster and these settings"""
+
+    polygon = (state or {}).get("polygon") or {}
+    if polygon.get("fingerprint") != fingerprint:
+        return False
+    if polygon.get("output") is None:
+        # nothing was visible so there is no file to check
+        return True
+    try:
+        return plan.polygon.stat().st_size == polygon.get("bytes")
+    except OSError:
+        return False
+
+
+def observer_fingerprint(run_config_hash: str, observer: dict[str, Any], crs: str) -> str:
+    """identify the observer values and settings behind one output"""
+
+    return payload_hash(
+        {
+            "run_config_hash": run_config_hash,
+            "observer": {name: observer.get(name) for name in OBSERVER_KEY_FIELDS},
+            "crs": crs,
+        }
+    )
 
 
 def plan_fingerprint(plan: Plan, run_config_hash: str) -> str:
     """identify the exact observer and settings behind one output"""
 
-    content = json.dumps(
-        {
-            "run_config_hash": run_config_hash,
-            "observer": asdict(plan.observer),
-            "crs": plan.analysis_crs,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return observer_fingerprint(run_config_hash, asdict(plan.observer), plan.analysis_crs)
+
+
+def adopt_legacy_outputs(
+    plans: Sequence[Plan],
+    output_directory: Path,
+    run_config_hash: str,
+    polygon_config_hash: str | None,
+) -> int:
+    """rename outputs saved under row numbered names and re-key their state
+
+    Earlier releases named files after the csv row and hashed the row number
+    and id into the resume fingerprint. Outputs made with the current settings
+    keep their rasters and polygons.
+    """
+
+    legacy: dict[str, tuple[Path, dict[str, Any]]] = {}
+    numbered = "[0-9][0-9][0-9][0-9][0-9][0-9]_*.json"
+    for path in sorted((output_directory / "state").glob(numbered)):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            legacy.setdefault(str(state["observer"]["id"]), (path, state))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+
+    adopted = 0
+    for plan in plans:
+        if plan.state.exists() or plan.observer.id not in legacy:
+            continue
+        path, state = legacy[plan.observer.id]
+        old_raster = output_directory / "rasters" / f"{path.stem}.tif"
+        old_polygon = output_directory / "polygons" / f"{path.stem}.gpkg"
+        if not old_raster.is_file() or plan.output.exists() or plan.polygon.exists():
+            continue
+        saved = state["observer"]
+        crs = state.get("analysis_crs")
+        old_fingerprint = payload_hash(
+            {"run_config_hash": run_config_hash, "observer": saved, "crs": crs}
+        )
+        if state.get("fingerprint") == old_fingerprint:
+            state["fingerprint"] = observer_fingerprint(run_config_hash, saved, crs)
+            polygon = state.get("polygon") or {}
+            if polygon_config_hash and polygon.get("fingerprint") == payload_hash(
+                {"raster": old_fingerprint, "polygons": polygon_config_hash}
+            ):
+                polygon["fingerprint"] = payload_hash(
+                    {"raster": state["fingerprint"], "polygons": polygon_config_hash}
+                )
+        os.replace(old_raster, plan.output)
+        state["output"] = str(plan.output.relative_to(output_directory))
+        if old_polygon.is_file():
+            plan.polygon.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old_polygon, plan.polygon)
+            if (state.get("polygon") or {}).get("output"):
+                state["polygon"]["output"] = str(plan.polygon.relative_to(output_directory))
+        write_json(plan.state, state)
+        path.unlink()
+        adopted += 1
+    return adopted
 
 
 # one observer from terrain crop through validated output
 
 
-def process_plan(
+def sql_literal(value: Any) -> str:
+    """format a python value for a sqlite select list"""
+
+    if value is None:
+        return "NULL"
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    # a decimal point keeps whole numbers from becoming an integer column
+    return repr(float(value))
+
+
+def valid_feature_count(toolchain: Toolchain, path: Path, layer: str) -> int:
+    """count features that still have a geometry after clipping and repair"""
+
+    result = toolchain.run(
+        "ogrinfo",
+        [
+            "-ro",
+            "-q",
+            str(path),
+            "-sql",
+            f'SELECT COUNT(*) AS n FROM "{layer}" WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)',
+        ],
+    )
+    match = re.search(r"\bn \(Integer(?:64)?\) = (\d+)", result.stdout)
+    if not match:
+        raise ToolError(f"could not count polygon features in {path}")
+    return int(match.group(1))
+
+
+def build_viewshed_raster(
     plan: Plan,
     source: Path,
     args: argparse.Namespace,
     toolchain: Toolchain,
-    run_config_hash: str,
+    work: Path,
+    warnings: list[str],
+    viewshed_fraction: float,
 ) -> dict[str, Any]:
-    """prepare terrain and create a validated viewshed for one observer"""
+    """prepare terrain and create a validated viewshed raster for one observer"""
 
-    started = time.monotonic()
-    fingerprint = plan_fingerprint(plan, run_config_hash)
-    if args.resume and state_reusable(plan, fingerprint, toolchain):
-        state = json.loads(plan.state.read_text(encoding="utf-8"))
-        state["run_status"] = "resumed"
-        log(f"[{plan.observer.id}] reused validated output")
-        progress("observer", id=plan.observer.id, stage="complete", resumed=True)
-        return state
-
-    work = args.output_dir / ".work" / plan.stem
-    if work.exists():
-        shutil.rmtree(work)
-    work.mkdir(parents=True)
-    plan.output.parent.mkdir(parents=True, exist_ok=True)
     projected_dem = work / "projected-dem.tif"
     temporary_output = plan.output.with_name(
         f".{plan.output.stem}.{uuid.uuid4().hex}.tmp{plan.output.suffix}"
     )
-    warnings: list[str] = []
     observer = plan.observer
     margin = observer.max_distance + args.cell_size
     bounds = (
@@ -801,8 +1014,6 @@ def process_plan(
         plan.observer_x + margin,
         plan.observer_y + margin,
     )
-    log(f"[{observer.id}] preparing projected dem ({plan.analysis_crs})")
-    progress("observer", id=observer.id, stage="preparing")
 
     # each observer gets a small projected terrain crop rather than a costly
     # reprojection of the full source mosaic
@@ -823,6 +1034,10 @@ def process_plan(
         "Float32",
         "-dstnodata",
         f"{args.warp_nodata:.17g}",
+        # cores are shared out between the observers running at the same time
+        "-multi",
+        "-wo",
+        f"NUM_THREADS={args.warp_threads}",
         "-of",
         "GTiff",
         "-co",
@@ -849,7 +1064,7 @@ def process_plan(
         )
 
     log(f"[{observer.id}] calculating viewshed")
-    progress("observer", id=observer.id, stage="viewshed")
+    progress("observer", id=observer.id, stage="viewshed", fraction=viewshed_fraction)
 
     # values are kept distinct so a gis can separate visibility from the
     # analysis boundary and true nodata without reading the state file
@@ -895,26 +1110,22 @@ def process_plan(
     )
     viewshed = toolchain.run("gdal_viewshed", viewshed_arguments)
     warnings.extend(warning_lines(viewshed.stdout, viewshed.stderr))
-    output_info = inspect_raster(toolchain, temporary_output, stats=True, checksum=True)
+    normal = args.output_mode == "NORMAL"
+    output_info = inspect_raster(
+        toolchain, temporary_output, stats=True, checksum=True, histogram=normal
+    )
     if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
         raise ToolError("gdal_viewshed did not create a usable output raster")
     output_valid_percent = band_valid_percent(output_info, 1)
     if output_valid_percent is None or output_valid_percent <= 0:
         raise ToolError("viewshed output has no measurable valid pixels")
+    visible = visible_summary(output_info, args.visible_value, args.cell_size) if normal else None
+    if visible and visible["cells"] == 0:
+        warnings.append("no cells are visible from this observer")
     os.replace(temporary_output, plan.output)
 
     band = output_info["bands"][0]
-    document = {
-        "schema_version": 1,
-        "status": "complete",
-        "run_status": "created",
-        "generated_utc": utc_now(),
-        "fingerprint": fingerprint,
-        "observer": asdict(observer),
-        "analysis_crs": plan.analysis_crs,
-        "analysis_x": plan.observer_x,
-        "analysis_y": plan.observer_y,
-        "output": str(plan.output.relative_to(args.output_dir)),
+    return {
         "raster": {
             "width": int(output_info["size"][0]),
             "height": int(output_info["size"][1]),
@@ -925,14 +1136,264 @@ def process_plan(
             "sha256": file_sha256(plan.output),
             "bytes": plan.output.stat().st_size,
         },
-        "warnings": warnings,
-        "elapsed_seconds": round(time.monotonic() - started, 3),
+        # area is in squared analysis crs units
+        "visible": visible,
     }
+
+
+def build_polygon(
+    plan: Plan,
+    visible: dict[str, Any] | None,
+    args: argparse.Namespace,
+    polygons: PolygonSettings,
+    toolchain: Toolchain,
+    work: Path,
+    fingerprint: str,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """dissolve the visible cells of one viewshed into a single polygon feature"""
+
+    empty = {"fingerprint": fingerprint, "output": None, "crs": polygons.crs, "features": 0}
+    plan.polygon.unlink(missing_ok=True)
+    if visible and visible["cells"] == 0:
+        return empty
+
+    observer = plan.observer
+    parts = work / "visible-parts.gpkg"
+    parts.unlink(missing_ok=True)
+    plan.polygon.parent.mkdir(parents=True, exist_ok=True)
+    temporary = plan.polygon.with_name(
+        f".{plan.polygon.stem}.{uuid.uuid4().hex}.tmp{plan.polygon.suffix}"
+    )
+    # diagonal neighbours are joined so thin ridgelines stay one shape
+    polygonize = toolchain.run(
+        "gdal_polygonize",
+        ["-8", "-q", "-b", "1", "-f", "GPKG", str(plan.output), str(parts), "parts", "value"],
+    )
+    warnings.extend(warning_lines(polygonize.stdout, polygonize.stderr))
+
+    attributes = {
+        "id": observer.id,
+        "x": observer.x,
+        "y": observer.y,
+        "observer_height": observer.observer_height,
+        "target_height": observer.target_height,
+        "max_distance": observer.max_distance,
+        "analysis_crs": plan.analysis_crs,
+        "cell_size": args.cell_size,
+        "visible_area": visible["area"] if visible else None,
+    }
+    # the cast keeps an unknown area from turning the column into text
+    attributes = {
+        name: f"CAST({sql_literal(value)} AS REAL)" if name == "visible_area" else sql_literal(value)
+        for name, value in attributes.items()
+    }
+    columns = ", ".join(f"{value} AS {name}" for name, value in attributes.items())
+    arguments = [
+        "-f",
+        "GPKG",
+        str(temporary),
+        str(parts),
+        "-dialect",
+        "SQLITE",
+        "-sql",
+        f"SELECT ST_Union(geom) AS geom, {columns} FROM parts WHERE value = {args.visible_value}",
+        "-nln",
+        OBSERVER_LAYER,
+        "-nlt",
+        "MULTIPOLYGON",
+        "-t_srs",
+        polygons.crs,
+    ]
+    if polygons.simplify:
+        # ogr2ogr simplifies before it reprojects so the tolerance stays in
+        # analysis crs units
+        arguments.extend(("-simplify", f"{polygons.simplify:.17g}"))
+    if polygons.clip:
+        arguments.extend(("-clipdst", str(polygons.clip)))
+    # reprojection and clipping can leave rings that touch or collapse
+    arguments.append("-makevalid")
+    dissolve = toolchain.run("ogr2ogr", arguments)
+    warnings.extend(warning_lines(dissolve.stdout, dissolve.stderr))
+
+    if valid_feature_count(toolchain, temporary, OBSERVER_LAYER) != 1:
+        temporary.unlink(missing_ok=True)
+        warnings.append("the visible area is empty after clipping so no polygon was written")
+        return empty
+    os.replace(temporary, plan.polygon)
+    return {
+        **empty,
+        "output": str(plan.polygon.relative_to(args.output_dir)),
+        "features": 1,
+        "bytes": plan.polygon.stat().st_size,
+    }
+
+
+def remove_shapefile(plan: Plan) -> None:
+    """delete every file that makes up one observer's shapefile"""
+
+    for suffix in SHAPEFILE_PARTS:
+        plan.shapefile.with_suffix(suffix).unlink(missing_ok=True)
+
+
+def export_shapefile(
+    plan: Plan,
+    polygon: dict[str, Any],
+    toolchain: Toolchain,
+    work: Path,
+) -> None:
+    """copy one observer's polygon to a shapefile for software that cannot read geopackage"""
+
+    remove_shapefile(plan)
+    if not polygon.get("output"):
+        return
+    names = ("id", *OBSERVER_KEY_FIELDS, "analysis_crs", "cell_size", "visible_area")
+    columns = ", ".join(
+        f"{name} AS {SHAPEFILE_FIELD_NAMES[name]}" if name in SHAPEFILE_FIELD_NAMES else name
+        for name in names
+    )
+    # written in the work folder first so a stopped run cannot leave half a shapefile
+    staging = work / "shapefile"
+    staging.mkdir(exist_ok=True)
+    toolchain.run(
+        "ogr2ogr",
+        [
+            "-f",
+            "ESRI Shapefile",
+            str(staging / plan.shapefile.name),
+            str(plan.polygon),
+            "-sql",
+            f"SELECT geom, {columns} FROM {OBSERVER_LAYER}",
+            "-nln",
+            plan.shapefile.stem,
+            "-lco",
+            "ENCODING=UTF-8",
+        ],
+    )
+    plan.shapefile.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in SHAPEFILE_PARTS:
+        part = (staging / plan.shapefile.name).with_suffix(suffix)
+        if part.is_file():
+            os.replace(part, plan.shapefile.with_suffix(suffix))
+    if not plan.shapefile.is_file():
+        raise ToolError(f"ogr2ogr did not create {plan.shapefile.name}")
+
+
+def process_plan(
+    plan: Plan,
+    source: Path,
+    args: argparse.Namespace,
+    toolchain: Toolchain,
+    run_config_hash: str,
+    polygons: PolygonSettings | None = None,
+) -> dict[str, Any]:
+    """run or resume the raster and polygon stages for one observer"""
+
+    started = time.monotonic()
+    observer = plan.observer
+    stage_starts = STAGE_STARTS[polygons is not None]
+    fingerprint = plan_fingerprint(plan, run_config_hash)
+    polygon_fingerprint = (
+        payload_hash({"raster": fingerprint, "polygons": polygons.config_hash}) if polygons else ""
+    )
+
+    # the raster and its polygon are checked separately so changing only the
+    # polygon settings does not repeat the much slower viewshed
+    previous = read_state(plan) if args.resume else None
+    raster_ready = state_reusable(plan, previous, fingerprint, toolchain)
+    polygon_ready = polygons is None or (
+        raster_ready and polygon_reusable(plan, previous, polygon_fingerprint)
+    )
+    shapefile_ready = not (polygons and polygons.shapefiles) or (
+        polygon_ready
+        and (
+            plan.shapefile.is_file()
+            or not ((previous or {}).get("polygon") or {}).get("output")
+        )
+    )
+    if previous is not None and raster_ready and polygon_ready and shapefile_ready:
+        if previous.get("observer") != asdict(observer):
+            # the row can move in the csv without touching the viewshed
+            previous["observer"] = asdict(observer)
+            write_json(plan.state, previous)
+        previous["run_status"] = "resumed"
+        log(f"[{observer.id}] reused validated output")
+        progress("observer", id=observer.id, stage="complete", fraction=1.0, resumed=True)
+        return previous
+
+    work = args.output_dir / ".work" / plan.stem
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    plan.output.parent.mkdir(parents=True, exist_ok=True)
+    progress("observer", id=observer.id, stage="preparing", fraction=stage_starts["preparing"])
+
+    if previous is not None and raster_ready:
+        document = {
+            **previous,
+            "run_status": "updated",
+            "generated_utc": utc_now(),
+            "observer": asdict(observer),
+        }
+        log(f"[{observer.id}] reused validated raster")
+    else:
+        log(f"[{observer.id}] preparing projected dem ({plan.analysis_crs})")
+        # a polygon traced from the raster being replaced would be stale
+        plan.polygon.unlink(missing_ok=True)
+        remove_shapefile(plan)
+        warnings: list[str] = []
+        document = {
+            "schema_version": 2,
+            "status": "complete",
+            "run_status": "created",
+            "generated_utc": utc_now(),
+            "fingerprint": fingerprint,
+            "observer": asdict(observer),
+            "analysis_crs": plan.analysis_crs,
+            "analysis_x": plan.observer_x,
+            "analysis_y": plan.observer_y,
+            "output": str(plan.output.relative_to(args.output_dir)),
+            **build_viewshed_raster(
+                plan, source, args, toolchain, work, warnings, stage_starts["viewshed"]
+            ),
+            "polygon": None,
+            "warnings": warnings,
+        }
+
+    if polygons is not None and not polygon_ready:
+        # saved first so a polygon failure does not cost the finished raster
+        write_json(plan.state, document)
+        remove_shapefile(plan)
+        log(f"[{observer.id}] tracing visible area polygon")
+        progress("observer", id=observer.id, stage="polygon", fraction=stage_starts["polygon"])
+        polygon_warnings: list[str] = []
+        document["polygon"] = {
+            **build_polygon(
+                plan,
+                document.get("visible"),
+                args,
+                polygons,
+                toolchain,
+                work,
+                polygon_fingerprint,
+                polygon_warnings,
+            ),
+            "warnings": polygon_warnings,
+        }
+    if polygons is not None and polygons.shapefiles:
+        export_shapefile(plan, document["polygon"], toolchain, work)
+
+    document["elapsed_seconds"] = round(time.monotonic() - started, 3)
     write_json(plan.state, document)
     if not args.keep_work:
         shutil.rmtree(work)
-    log(f"[{observer.id}] complete -> {plan.output}")
-    progress("observer", id=observer.id, stage="complete", output=str(plan.output))
+    log(
+        f"[{observer.id}] complete in {format_duration(time.monotonic() - started)}"
+        f" -> {plan.output}"
+    )
+    progress(
+        "observer", id=observer.id, stage="complete", fraction=1.0, output=str(plan.output)
+    )
     return document
 
 
@@ -942,18 +1403,134 @@ def process_plan_with_cleanup(
     args: argparse.Namespace,
     toolchain: Toolchain,
     run_config_hash: str,
+    polygons: PolygonSettings | None = None,
 ) -> dict[str, Any]:
     """run one plan and remove partial files whether it passes or fails"""
 
     try:
-        return process_plan(plan, source, args, toolchain, run_config_hash)
+        return process_plan(plan, source, args, toolchain, run_config_hash, polygons)
     finally:
-        for temporary in plan.output.parent.glob(f".{plan.output.stem}.*"):
-            if temporary.is_file():
-                temporary.unlink(missing_ok=True)
+        for target in (plan.output, plan.polygon):
+            for temporary in target.parent.glob(f".{target.stem}.*"):
+                if temporary.is_file():
+                    temporary.unlink(missing_ok=True)
         work = args.output_dir / ".work" / plan.stem
         if work.exists() and not args.keep_work:
             shutil.rmtree(work, ignore_errors=True)
+
+
+def payload_hash(payload: dict[str, Any]) -> str:
+    """hash a json document the same way on every run"""
+
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+# products that describe the whole run
+
+
+def prepare_clip(
+    toolchain: Toolchain,
+    boundary: Path,
+    crs: str,
+    work_directory: Path,
+) -> Path:
+    """project the clip boundary once so every observer can share it"""
+
+    clip = work_directory / "polygon-clip.gpkg"
+    clip.unlink(missing_ok=True)
+    toolchain.run(
+        "ogr2ogr",
+        ["-f", "GPKG", str(clip), str(boundary), "-t_srs", crs, "-nln", "clip", "-makevalid"],
+    )
+    return clip
+
+
+def build_combined(
+    states: Sequence[dict[str, Any]],
+    args: argparse.Namespace,
+    toolchain: Toolchain,
+    previous: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """gather every observer polygon into one file with a dissolved coverage layer"""
+
+    polygons = [state["polygon"] for state in states if (state.get("polygon") or {}).get("output")]
+    combined = args.output_dir / "viewsheds.gpkg"
+    if not polygons:
+        combined.unlink(missing_ok=True)
+        return None
+    fingerprint = payload_hash({"polygons": [polygon["fingerprint"] for polygon in polygons]})
+    if (
+        args.resume
+        and previous
+        and previous.get("fingerprint") == fingerprint
+        and combined.is_file()
+        and combined.stat().st_size == previous.get("bytes")
+    ):
+        log(f"reused combined polygons: {combined}")
+        return previous
+
+    log(f"combining {len(polygons)} polygons and dissolving coverage")
+    progress("products", stage="combining", polygons=len(polygons))
+    work = args.output_dir / ".work"
+    temporary = work / f"viewsheds.{uuid.uuid4().hex}.gpkg"
+    coverage = work / f"coverage.{uuid.uuid4().hex}.gpkg"
+    try:
+        for index, polygon in enumerate(polygons):
+            toolchain.run(
+                "ogr2ogr",
+                [
+                    "-f",
+                    "GPKG",
+                    *(("-update", "-append") if index else ()),
+                    str(temporary),
+                    str(args.output_dir / polygon["output"]),
+                    "-nln",
+                    OBSERVER_LAYER,
+                    "-nlt",
+                    "MULTIPOLYGON",
+                ],
+            )
+        toolchain.run(
+            "ogr2ogr",
+            [
+                "-f",
+                "GPKG",
+                str(coverage),
+                str(temporary),
+                "-dialect",
+                "SQLITE",
+                "-sql",
+                f"SELECT ST_Union(geom) AS geom, COUNT(*) AS observers FROM {OBSERVER_LAYER}",
+                "-nln",
+                COVERAGE_LAYER,
+                "-nlt",
+                "MULTIPOLYGON",
+                "-makevalid",
+            ],
+        )
+        # the second layer lets one file answer both which observer sees a
+        # place and whether any observer does
+        toolchain.run(
+            "ogr2ogr",
+            ["-f", "GPKG", "-update", str(temporary), str(coverage), "-nln", COVERAGE_LAYER],
+        )
+        if valid_feature_count(toolchain, temporary, COVERAGE_LAYER) != 1:
+            raise ToolError("dissolved coverage is empty")
+        os.replace(temporary, combined)
+    finally:
+        for leftover in work.glob(f"{temporary.stem}*"):
+            leftover.unlink(missing_ok=True)
+        for leftover in work.glob(f"{coverage.stem}*"):
+            leftover.unlink(missing_ok=True)
+    return {
+        "output": combined.name,
+        "fingerprint": fingerprint,
+        "observer_layer": OBSERVER_LAYER,
+        "coverage_layer": COVERAGE_LAYER,
+        "polygons": len(polygons),
+        "bytes": combined.stat().st_size,
+    }
 
 
 def config_document(
@@ -964,7 +1541,7 @@ def config_document(
     """record every input and setting that can change an output"""
 
     return {
-        "tool_version": TOOL_VERSION,
+        "tool_version": RASTER_PIPELINE_VERSION,
         "gdal_version": gdal_version,
         "dem_inventory": [
             {
@@ -1073,10 +1650,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="geotiff creation option as name=value; repeat when needed",
     )
     parser.add_argument(
+        "--polygons",
+        action="store_true",
+        help="also trace each visible area as a polygon and build a combined coverage file",
+    )
+    parser.add_argument(
+        "--polygon-crs",
+        default="EPSG:4326",
+        help="crs shared by every polygon output",
+    )
+    parser.add_argument(
+        "--polygon-simplify",
+        type=float,
+        default=0.0,
+        help="simplification tolerance in analysis crs units; 0 keeps every cell edge",
+    )
+    parser.add_argument(
+        "--shapefiles",
+        action="store_true",
+        help="also save each polygon as a shapefile for software such as arcgis",
+    )
+    parser.add_argument(
+        "--polygon-clip",
+        type=Path,
+        help="vector file such as a land mask; polygons are trimmed to its features",
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
-        default=min(4, os.cpu_count() or 1),
-        help="number of observers processed at the same time",
+        default=DEFAULT_JOBS,
+        help=f"number of observers processed at the same time (default: {DEFAULT_JOBS})",
     )
     parser.add_argument("--timeout", type=float, help="time limit in seconds for each gdal command")
     parser.add_argument(
@@ -1131,6 +1734,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--band must be at least 1")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    if not math.isfinite(args.polygon_simplify) or args.polygon_simplify < 0:
+        parser.error("--polygon-simplify cannot be negative")
+    if args.polygons and args.output_mode != "NORMAL":
+        parser.error("--polygons needs the normal output mode")
+    if not args.polygons and (args.polygon_simplify or args.polygon_clip or args.shapefiles):
+        parser.error("--polygon-simplify, --polygon-clip, and --shapefiles need --polygons")
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.output_nodata is None:
@@ -1184,7 +1793,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def output_conflicts(plans: Sequence[Plan]) -> list[Path]:
     """list output or state paths that are already present"""
 
-    return [path for plan in plans for path in (plan.output, plan.state) if path.exists()]
+    return [
+        path
+        for plan in plans
+        for path in (plan.output, plan.state, plan.polygon, plan.shapefile)
+        if path.exists()
+    ]
 
 
 class OutputLock:
@@ -1252,30 +1866,31 @@ def run(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 f"--output-dir cannot be inside a searched dem directory: {dem_path}"
             )
+    if args.polygon_clip:
+        args.polygon_clip = args.polygon_clip.expanduser().resolve()
+        if not args.polygon_clip.is_file():
+            raise ValueError(f"polygon clip boundary not found: {args.polygon_clip}")
+    # a run that failed before its first viewshed leaves only scratch files
     if (
         args.output_dir.is_dir()
-        and any(args.output_dir.iterdir())
+        and any(item.name != ".work" for item in args.output_dir.iterdir())
         and not (args.overwrite or args.resume or args.dry_run)
     ):
         raise ValueError(
             "output directory is not empty; use --overwrite, --resume, or a new directory"
         )
     dem_files = discover_dems(args.dem)
-    required_tools = {
-        "gdal_viewshed",
-        "gdalinfo",
-        "gdalsrsinfo",
-        "gdaltransform",
-        "gdalwarp",
-    }
-    required_tools.add("gdalbuildvrt")
+    required_tools = {*RASTER_TOOLS, *(POLYGON_TOOLS if args.polygons else ())}
     runtime = discover_gdal_runtime(args.gdal_bin, tuple(sorted(required_tools)))
     toolchain = Toolchain(
         timeout=args.timeout,
-        gdal_python=args.gdal_python,
+        # polygon tools are python scripts in some installs and need the
+        # interpreter that ships with the gdal bindings
+        gdal_python=args.gdal_python or runtime.python,
         tool_directories=runtime.tool_directories,
         environment=runtime.environment(),
     )
+    args.warp_threads = max(1, (os.cpu_count() or 1) // min(args.jobs, len(observers)))
     for tool in sorted(required_tools):
         toolchain.command(tool)
     gdal_version, _ = toolchain.gdal_version()
@@ -1315,6 +1930,38 @@ def run(argv: Sequence[str] | None = None) -> int:
         for analysis_crs in sorted({plan.analysis_crs for plan in plans}):
             if not crs_is_projected(toolchain, analysis_crs):
                 raise ValueError(f"analysis crs is not projected: {analysis_crs}")
+        polygons: PolygonSettings | None = None
+        if args.polygons:
+            clip = (
+                prepare_clip(toolchain, args.polygon_clip, args.polygon_crs, work_directory)
+                if args.polygon_clip
+                else None
+            )
+            polygons = PolygonSettings(
+                args.polygon_crs,
+                args.polygon_simplify,
+                clip,
+                payload_hash(
+                    {
+                        "pipeline": POLYGON_PIPELINE_VERSION,
+                        "crs": args.polygon_crs,
+                        "simplify": args.polygon_simplify,
+                        "clip_sha256": file_sha256(args.polygon_clip) if clip else None,
+                    }
+                ),
+                args.shapefiles,
+            )
+        config = config_document(args, dem_files, gdal_version)
+        run_config_hash = payload_hash(config)
+        if not args.dry_run:
+            adopted = adopt_legacy_outputs(
+                plans,
+                args.output_dir,
+                run_config_hash,
+                polygons.config_hash if polygons else None,
+            )
+            if adopted:
+                log(f"renamed {adopted} viewsheds saved by an earlier version of this tool")
         conflicts = output_conflicts(plans)
         if conflicts and not (args.overwrite or args.resume or args.dry_run):
             preview = "\n".join(f"  {path}" for path in conflicts[:10])
@@ -1323,12 +1970,9 @@ def run(argv: Sequence[str] | None = None) -> int:
                 "outputs already exist; use --overwrite or --resume:\n" + preview + suffix
             )
 
-        config = config_document(args, dem_files, gdal_version)
-        serialized_config = json.dumps(config, sort_keys=True, separators=(",", ":"))
-        run_config_hash = hashlib.sha256(serialized_config.encode("utf-8")).hexdigest()
         log(
             f"gdal: {gdal_version}; dems: {len(dem_files)}; observers: {len(plans)}; "
-            f"jobs: {args.jobs}"
+            f"jobs: {args.jobs}; polygons: {'yes' if polygons else 'no'}"
         )
         progress(
             "plan",
@@ -1352,14 +1996,59 @@ def run(argv: Sequence[str] | None = None) -> int:
             for plan in plans:
                 plan.output.unlink(missing_ok=True)
                 plan.state.unlink(missing_ok=True)
+                plan.polygon.unlink(missing_ok=True)
+                remove_shapefile(plan)
         manifest_path = args.output_dir / "manifest.json"
+        try:
+            previous_combined = json.loads(manifest_path.read_text(encoding="utf-8")).get(
+                "combined"
+            )
+        except (OSError, json.JSONDecodeError, AttributeError):
+            previous_combined = None
+        run_started = time.monotonic()
+        combined: dict[str, Any] | None = None
+
+        def save_manifest() -> None:
+            """record the settings and every result known so far"""
+
+            write_json(
+                manifest_path,
+                {
+                    "schema_version": 2,
+                    "generated_utc": utc_now(),
+                    "tool": "bulk-gdal-viewshed",
+                    "tool_version": TOOL_VERSION,
+                    "gdal_version": gdal_version,
+                    "config_hash": run_config_hash,
+                    "config": config,
+                    "polygons": (
+                        {
+                            "crs": args.polygon_crs,
+                            "simplify": args.polygon_simplify,
+                            "clip": str(args.polygon_clip) if args.polygon_clip else None,
+                            "shapefiles": args.shapefiles,
+                        }
+                        if polygons
+                        else None
+                    ),
+                    "combined": combined,
+                    "observers": [results[key] for key in sorted(results)],
+                },
+            )
+
         results: dict[int, dict[str, Any]] = {}
         failures: list[dict[str, Any]] = []
         futures: dict[Future[dict[str, Any]], Plan] = {}
         with ThreadPoolExecutor(max_workers=args.jobs, thread_name_prefix="viewshed") as executor:
             for plan in plans:
                 futures[executor.submit(
-                    process_plan_with_cleanup, plan, source, args, toolchain, run_config_hash
+                    process_plan_with_cleanup,
+                    plan,
+                    source,
+                    args,
+                    toolchain,
+                    run_config_hash,
+                    polygons,
                 )] = plan
             for future in as_completed(futures):
                 plan = futures[future]
@@ -1389,34 +2078,39 @@ def run(argv: Sequence[str] | None = None) -> int:
 
                 # update the manifest after every observer so a stopped run
                 # still leaves a useful record of completed and failed work
-                manifest = {
-                    "schema_version": 1,
-                    "generated_utc": utc_now(),
-                    "tool": "bulk-gdal-viewshed",
-                    "tool_version": TOOL_VERSION,
-                    "gdal_version": gdal_version,
-                    "config_hash": run_config_hash,
-                    "config": config,
-                    "observers": [results[key] for key in sorted(results)],
-                }
-                write_json(manifest_path, manifest)
+                save_manifest()
 
         if SIGNAL_CANCELLED.is_set():
             log("cancelled")
             return 130
-        complete = sum(item.get("status") == "complete" for item in results.values())
+        complete = [
+            results[key] for key in sorted(results) if results[key].get("status") == "complete"
+        ]
+        combined_error: str | None = None
+        if polygons and not CANCEL_REQUESTED.is_set():
+            # built from whatever finished so one bad observer does not hold
+            # back the coverage for the rest
+            try:
+                combined = build_combined(complete, args, toolchain, previous_combined)
+            except ToolError as error:
+                combined_error = str(error)
+                log(f"combined polygons failed: {error}")
+            save_manifest()
+        elapsed = time.monotonic() - run_started
         log(
-            f"finished with {complete} complete and {len(failures)} failed. "
-            f"manifest saved to {manifest_path}"
+            f"finished in {format_duration(elapsed)} with {len(complete)} complete and "
+            f"{len(failures)} failed. manifest saved to {manifest_path}"
         )
+        failed = bool(failures or combined_error)
         progress(
             "finished",
-            status="failed" if failures else "complete",
-            complete=complete,
+            status="failed" if failed else "complete",
+            complete=len(complete),
             failed=len(failures),
             manifest=str(manifest_path),
+            elapsed_seconds=round(elapsed, 1),
         )
-        return 1 if failures else 0
+        return 1 if failed else 0
     finally:
         if lock is not None:
             lock.release()
