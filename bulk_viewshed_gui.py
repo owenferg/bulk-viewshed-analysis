@@ -22,7 +22,7 @@ except ImportError as error:  # pragma: no cover - this depends on the system py
         "standard python installer from python.org"
     ) from error
 
-from bulk_viewshed import discover_dems, load_observers
+from bulk_viewshed import DEFAULT_JOBS, discover_dems, format_duration, load_observers
 
 
 APP_NAME = "bulk viewshed analysis"
@@ -35,6 +35,43 @@ EXISTING_CHOICES = {
     "rebuild matching viewsheds": "overwrite",
     "stop if output files exist": "stop",
 }
+STAGE_LABELS = {
+    "preparing": "preparing terrain",
+    "viewshed": "calculating viewshed",
+    "polygon": "tracing visible area",
+}
+# form values remembered between sessions
+SETTING_NAMES = (
+    "observers",
+    "output",
+    "observer_crs",
+    "analysis_crs",
+    "cell_size",
+    "max_distance",
+    "observer_height",
+    "target_height",
+    "jobs",
+    "existing",
+    "polygons",
+    "polygon_simplify",
+    "polygon_crs",
+    "polygon_clip",
+    "shapefiles",
+    "gdal_location",
+    "band",
+    "resampling",
+    "curvature",
+    "source_nodata",
+    "output_mode",
+    "allow_gaps",
+    "allow_outside",
+    "allow_extra",
+    "keep_work",
+    "hash_sources",
+    "fail_fast",
+)
+# file and folder choices that a reset to defaults leaves alone
+PATH_SETTINGS = {"observers", "output", "polygon_clip", "gdal_location"}
 
 
 def open_folder(path: Path) -> None:
@@ -101,14 +138,15 @@ class ViewshedWindow(tk.Tk):
 
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("920x780")
-        self.minsize(760, 650)
+        self.geometry("920x810")
+        self.minsize(760, 680)
         self.protocol("WM_DELETE_WINDOW", self.close_window)
 
         self.process: subprocess.Popen[str] | None = None
         self.messages: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.completed_ids: set[str] = set()
         self.failed_ids: set[str] = set()
+        self.fractions: dict[str, float] = {}
         self.total_observers = 0
         self.run_kind = "run"
         self.cancel_requested = False
@@ -130,8 +168,13 @@ class ViewshedWindow(tk.Tk):
         self.max_distance = tk.StringVar(value="20000")
         self.observer_height = tk.StringVar(value="2")
         self.target_height = tk.StringVar(value="0")
-        self.jobs = tk.IntVar(value=min(4, os.cpu_count() or 1))
+        self.jobs = tk.IntVar(value=DEFAULT_JOBS)
         self.existing = tk.StringVar(value="resume finished viewsheds")
+        self.polygons = tk.BooleanVar(value=False)
+        self.polygon_simplify = tk.StringVar(value="0")
+        self.polygon_crs = tk.StringVar(value="EPSG:4326")
+        self.polygon_clip = tk.StringVar()
+        self.shapefiles = tk.BooleanVar(value=False)
         self.gdal_location = tk.StringVar()
         self.band = tk.IntVar(value=1)
         self.resampling = tk.StringVar(value="bilinear")
@@ -145,6 +188,7 @@ class ViewshedWindow(tk.Tk):
         self.hash_sources = tk.BooleanVar(value=False)
         self.fail_fast = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="ready, choose observer locations and elevation data")
+        self.defaults = {name: getattr(self, name).get() for name in SETTING_NAMES}
 
     def _build_interface(self) -> None:
         """arrange the everyday workflow above progress and logs"""
@@ -164,6 +208,7 @@ class ViewshedWindow(tk.Tk):
         notebook.pack(fill="x")
         basic = ttk.Frame(notebook, padding=10)
         advanced = ttk.Frame(notebook, padding=10)
+        self.setting_tabs = (basic, advanced)
         notebook.add(basic, text="inputs and settings")
         notebook.add(advanced, text="advanced")
         self._build_basic_tab(basic)
@@ -175,16 +220,9 @@ class ViewshedWindow(tk.Tk):
         self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate", maximum=1)
         self.progress_bar.pack(fill="x", pady=(6, 0))
 
-        log_frame = ttk.Frame(root)
-        log_frame.pack(fill="both", expand=True)
-        self.log = tk.Text(log_frame, height=12, wrap="word", state="disabled")
-        self.log.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.log.configure(yscrollcommand=scrollbar.set)
-
+        # the buttons claim their row first so a short window shrinks the log
         buttons = ttk.Frame(root)
-        buttons.pack(fill="x", pady=(8, 0))
+        buttons.pack(side="bottom", fill="x", pady=(8, 0))
         self.check_button = ttk.Button(buttons, text="check inputs", command=self.check_inputs)
         self.check_button.pack(side="left")
         self.run_button = ttk.Button(buttons, text="run viewsheds", command=self.start_run)
@@ -193,6 +231,18 @@ class ViewshedWindow(tk.Tk):
         self.cancel_button.pack(side="left")
         self.open_button = ttk.Button(buttons, text="open output folder", command=self.open_output)
         self.open_button.pack(side="right")
+        self.reset_button = ttk.Button(
+            buttons, text="reset settings", command=self.reset_settings
+        )
+        self.reset_button.pack(side="right", padx=6)
+
+        log_frame = ttk.Frame(root)
+        log_frame.pack(fill="both", expand=True)
+        self.log = tk.Text(log_frame, height=12, wrap="word", state="disabled")
+        self.log.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=scrollbar.set)
         self._set_running(False)
 
     def _build_basic_tab(self, parent: ttk.Frame) -> None:
@@ -281,7 +331,16 @@ class ViewshedWindow(tk.Tk):
         ttk.Spinbox(parent, from_=1, to=max(1, os.cpu_count() or 1), textvariable=self.jobs).grid(
             row=row, column=1, sticky="ew", pady=2
         )
-        ttk.Label(parent, text="2 to 4 works well on most computers", foreground="#555555").grid(
+        ttk.Label(parent, text="each one needs its own share of memory", foreground="#555555").grid(
+            row=row, column=2, sticky="w", padx=(8, 0)
+        )
+
+        row += 1
+        ttk.Label(parent, text="polygons").grid(row=row, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(
+            parent, variable=self.polygons, text="also trace each visible area as a polygon"
+        ).grid(row=row, column=1, sticky="w", pady=2)
+        ttk.Label(parent, text="adds a combined coverage file", foreground="#555555").grid(
             row=row, column=2, sticky="w", padx=(8, 0)
         )
 
@@ -295,6 +354,8 @@ class ViewshedWindow(tk.Tk):
             ("earth curvature", self.curvature, "0.85714 includes standard refraction"),
             ("source nodata", self.source_nodata, "leave blank to use the raster value"),
             ("output mode", self.output_mode, "normal maps visible and hidden cells"),
+            ("polygon simplify", self.polygon_simplify, "in viewshed crs units, 0 for none"),
+            ("polygon crs", self.polygon_crs, "one crs shared by every polygon"),
         ]
         for row, (label, variable, help_text) in enumerate(fields):
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -312,9 +373,25 @@ class ViewshedWindow(tk.Tk):
             )
 
         row = len(fields)
+        ttk.Label(parent, text="polygon clip boundary").grid(
+            row=row, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        PathRow(
+            parent,
+            self.polygon_clip,
+            "choose a boundary to trim polygons to",
+            False,
+            (("vector files", "*.geojson *.json *.gpkg *.shp"), ("all files", "*.*")),
+        ).grid(row=row, column=1, sticky="ew", pady=3)
+        ttk.Label(parent, text="such as a land mask", foreground="#555555").grid(
+            row=row, column=2, sticky="w", padx=(8, 0)
+        )
+
+        row += 1
         ttk.Separator(parent).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
         checks = (
             (self.allow_extra, "ignore extra csv columns from gis exports"),
+            (self.shapefiles, "also save each polygon as a shapefile for arcgis"),
             (self.allow_gaps, "allow missing elevation cells inside a viewshed"),
             (self.allow_outside, "allow locations outside the elevation data"),
             (self.keep_work, "keep projected terrain files"),
@@ -347,31 +424,7 @@ class ViewshedWindow(tk.Tk):
             values = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
-        variable_names = (
-            "observers",
-            "output",
-            "observer_crs",
-            "analysis_crs",
-            "cell_size",
-            "max_distance",
-            "observer_height",
-            "target_height",
-            "jobs",
-            "existing",
-            "gdal_location",
-            "band",
-            "resampling",
-            "curvature",
-            "source_nodata",
-            "output_mode",
-            "allow_gaps",
-            "allow_outside",
-            "allow_extra",
-            "keep_work",
-            "hash_sources",
-            "fail_fast",
-        )
-        for name in variable_names:
+        for name in SETTING_NAMES:
             if name in values:
                 try:
                     getattr(self, name).set(values[name])
@@ -386,31 +439,7 @@ class ViewshedWindow(tk.Tk):
     def _save_settings(self) -> None:
         """remember form values without making a project file necessary"""
 
-        names = (
-            "observers",
-            "output",
-            "observer_crs",
-            "analysis_crs",
-            "cell_size",
-            "max_distance",
-            "observer_height",
-            "target_height",
-            "jobs",
-            "existing",
-            "gdal_location",
-            "band",
-            "resampling",
-            "curvature",
-            "source_nodata",
-            "output_mode",
-            "allow_gaps",
-            "allow_outside",
-            "allow_extra",
-            "keep_work",
-            "hash_sources",
-            "fail_fast",
-        )
-        document = {name: getattr(self, name).get() for name in names}
+        document = {name: getattr(self, name).get() for name in SETTING_NAMES}
         document["dem_paths"] = self.dem_paths
         try:
             SETTINGS_PATH.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
@@ -509,6 +538,16 @@ class ViewshedWindow(tk.Tk):
             self._numeric(self.source_nodata, "source nodata")
         if not self.observer_crs.get().strip() or not self.analysis_crs.get().strip():
             raise ValueError("both crs fields are required")
+        if self.polygons.get():
+            if self.output_mode.get().casefold() != "normal":
+                raise ValueError("polygons need the normal output mode")
+            if self._numeric(self.polygon_simplify, "polygon simplify") < 0:
+                raise ValueError("polygon simplify cannot be negative")
+            if not self.polygon_crs.get().strip():
+                raise ValueError("polygon crs is required")
+            clip = self.polygon_clip.get().strip()
+            if clip and not Path(clip).expanduser().is_file():
+                raise ValueError(f"polygon clip boundary not found: {clip}")
         observers = load_observers(
             observer_path,
             observer_height,
@@ -550,6 +589,18 @@ class ViewshedWindow(tk.Tk):
             arguments.append("--resume")
         elif existing_policy == "overwrite":
             arguments.append("--overwrite")
+        if self.polygons.get():
+            arguments.extend(
+                (
+                    "--polygons",
+                    "--polygon-crs", self.polygon_crs.get().strip(),
+                    "--polygon-simplify", self.polygon_simplify.get().strip(),
+                )
+            )
+            if self.polygon_clip.get().strip():
+                arguments.extend(("--polygon-clip", self.polygon_clip.get().strip()))
+            if self.shapefiles.get():
+                arguments.append("--shapefiles")
         if self.gdal_location.get().strip():
             arguments.extend(("--gdal-bin", self.gdal_location.get().strip()))
         if self.source_nodata.get().strip():
@@ -599,6 +650,7 @@ class ViewshedWindow(tk.Tk):
         self.run_kind = "check" if dry_run else "run"
         self.completed_ids.clear()
         self.failed_ids.clear()
+        self.fractions.clear()
         self.total_observers = 0
         self.cancel_requested = False
         self.progress_bar.configure(maximum=1, value=0)
@@ -691,16 +743,21 @@ class ViewshedWindow(tk.Tk):
                 self.failed_ids.add(identifier)
                 self.status.set(f"failed: {identifier}, continuing with the other observers")
             else:
-                label = "preparing terrain" if stage == "preparing" else "calculating viewshed"
-                self.status.set(f"{identifier}: {label}")
-            self.progress_bar["value"] = len(self.completed_ids | self.failed_ids)
+                self.status.set(f"{identifier}: {STAGE_LABELS.get(stage, stage)}")
+            # partial credit for finished stages keeps the bar moving while
+            # several long observers are still running
+            finished = stage in ("complete", "failed")
+            self.fractions[identifier] = 1.0 if finished else float(event.get("fraction", 0.0))
+            self.progress_bar["value"] = sum(self.fractions.values())
+        elif event_type == "products":
+            self.status.set("combining polygons and dissolving coverage…")
         elif event_type == "finished":
             if event.get("status") == "validated":
                 self.status.set("inputs passed the check, no viewsheds were created")
             else:
                 self.status.set(
-                    f"finished: {event.get('complete', 0)} complete and "
-                    f"{event.get('failed', 0)} failed"
+                    f"finished in {format_duration(float(event.get('elapsed_seconds', 0)))}: "
+                    f"{event.get('complete', 0)} complete and {event.get('failed', 0)} failed"
                 )
 
     def _handle_exit(self, exit_code: int) -> None:
@@ -766,6 +823,24 @@ class ViewshedWindow(tk.Tk):
         self.run_button.configure(state=state)
         self.cancel_button.configure(state="normal" if running else "disabled")
         self.open_button.configure(state="disabled" if running else "normal")
+        self.reset_button.configure(state=state)
+        # settings are locked during a run so the form always matches the work in progress
+        pending = list(self.setting_tabs)
+        while pending:
+            widget = pending.pop()
+            pending.extend(widget.winfo_children())
+            if isinstance(widget, ttk.Combobox):
+                widget.configure(state="disabled" if running else "readonly")
+            elif isinstance(widget, (ttk.Entry, ttk.Button, ttk.Checkbutton, tk.Listbox)):
+                widget.configure(state=state)
+
+    def reset_settings(self) -> None:
+        """return every setting to its default while keeping the chosen files and folders"""
+
+        for name, value in self.defaults.items():
+            if name not in PATH_SETTINGS:
+                getattr(self, name).set(value)
+        self.status.set("settings reset to their defaults, your files and folders were kept")
 
     def _append_log(self, text: str) -> None:
         """append one line while keeping the read only log at its end"""
