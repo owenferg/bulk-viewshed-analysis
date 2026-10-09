@@ -24,7 +24,7 @@ QGIS is the easiest way to install GDAL if you do not already have it
 
 some linux systems may also need `python3-tk`
 
-on macos the python that comes with the system uses an old tk toolkit that can draw an empty window. if that happens install python from [python.org](https://www.python.org/downloads/) and open the launcher again
+on macos the python that comes with the system uses an old tk toolkit that opens an empty window. the launcher looks for a newer python first, including homebrew and python.org installs. if the window is still empty install python from [python.org](https://www.python.org/downloads/) or run `brew install python-tk` and open the launcher again
 
 ## Set up a run
 

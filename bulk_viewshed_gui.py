@@ -138,8 +138,8 @@ class ViewshedWindow(tk.Tk):
 
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("920x810")
-        self.minsize(760, 680)
+        self.geometry("920x860")
+        self.minsize(760, 720)
         self.protocol("WM_DELETE_WINDOW", self.close_window)
 
         self.process: subprocess.Popen[str] | None = None
@@ -398,10 +398,14 @@ class ViewshedWindow(tk.Tk):
             (self.hash_sources, "slower but safer resume checks"),
             (self.fail_fast, "stop after the first failed observer"),
         )
-        for variable, text in checks:
-            row += 1
-            ttk.Checkbutton(parent, variable=variable, text=text).grid(
-                row=row, column=0, columnspan=3, sticky="w", pady=2
+        # two columns keep this tab short enough to leave room for the log
+        row += 1
+        check_frame = ttk.Frame(parent)
+        check_frame.grid(row=row, column=0, columnspan=3, sticky="ew")
+        for index, (variable, text) in enumerate(checks):
+            check_frame.columnconfigure(index % 2, weight=1, uniform="checks")
+            ttk.Checkbutton(check_frame, variable=variable, text=text).grid(
+                row=index // 2, column=index % 2, sticky="w", pady=2
             )
 
         row += 1
